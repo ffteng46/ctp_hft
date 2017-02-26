@@ -1,4 +1,4 @@
-#include "MdSpi.h"
+﻿#include "MdSpi.h"
 #include "TraderSpi.h"
 #include <iostream>
 #include <sstream>
@@ -46,9 +46,9 @@ extern int iRequestID;
 //上一次成交总量
 long totalVolume = 0;
 extern int offset_flag;
-string getCloseMethod();
 extern boost::lockfree::queue<LogMsg*> mkdataqueue;
 extern boost::lockfree::queue<LogMsg*> logqueue;
+extern boost::lockfree::queue<MkDataPrice*> mkdatapricequeue;
 void CMdSpi::OnRspError(CThostFtdcRspInfoField *pRspInfo,
 		int nRequestID, bool bIsLast)
 {
@@ -121,491 +121,19 @@ void CMdSpi::OnRspUnSubMarketData(CThostFtdcSpecificInstrumentField *pSpecificIn
 
 void CMdSpi::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField *pDepthMarketData)
 {
-	cout<<"----------------------->"<<getCloseMethod()<<endl;
+    OnRtnMarketDataTwo(pDepthMarketData);
+    //cout<<"----------------------->"<<getCloseMethod()<<endl;
 	//处理行情
 	int64_t start_time = GetSysTimeMicros();
     auto chro_start_time = boost::chrono::high_resolution_clock::now();
 	string marketdata;
 	stringstream ss;
-	//买量-卖量差值
-	int sprd = pDepthMarketData->BidVolume1 - pDepthMarketData->AskVolume1;
-	int abst = std::abs(sprd);
-	char *char_inst= pDepthMarketData->InstrumentID;
-	string str_inst = string(char_inst);
-	bool is_staight_insert = false;//没有持仓直接报单
-    unordered_map<string,unordered_map<string,int>>::iterator map_strs = positionmap.find(str_inst);//持仓信息
-    for(unordered_map<string,unordered_map<string,int>>::iterator it=positionmap.begin();it != positionmap.end();it ++){
-		string tmpmsg;
-		tmpmsg.append(it->first).append("持仓情况:");
-		char char_tmp_pst[10] = {'\0'};
-		sprintf(char_tmp_pst,"%d",it->second["longTotalPosition"]);
-		tmpmsg.append("多头数量=");
-		tmpmsg.append(char_tmp_pst);
-		char char_tmp_pst2[10] = {'\0'};
-		sprintf(char_tmp_pst2,"%d",it->second["shortTotalPosition"]);
-		tmpmsg.append("空头数量=");
-		tmpmsg.append(char_tmp_pst2);
-		cout<<tmpmsg<<endl;
-	}
-	//多头持仓
-	int longTotalPosition = 0;
-	//空头持仓
-	int shortTotalPosition = 0;
-	if(map_strs == positionmap.end()){//没有查询到,直接下单
-		cout<<"can't find instrumentid:"<<str_inst<<",there is no position,staight to order insert!"<<endl;
-		is_staight_insert = true;
-		marketdata.append("strait;");
-	}else{
-		//多头持仓
-		longTotalPosition = map_strs->second["longTotalPosition"];
-		//空头持仓
-		shortTotalPosition = map_strs->second["shortTotalPosition"];
-	}
-	double mk_bidprice = pDepthMarketData->BidPrice1;
-	double mk_askprice = pDepthMarketData->AskPrice1;
-	long this_trade_vol = 0;//本次成交量
-	if(totalVolume == 0){
-		totalVolume = pDepthMarketData->Volume;
-	}else{
-		this_trade_vol = pDepthMarketData->Volume - totalVolume;
-		totalVolume = pDepthMarketData->Volume;
-	}
-	if(abst >= bid_ask_spread && sprd > 0 && this_trade_vol >= trade_volume){//买强
-		//判断用行情价格
-		double bidprice = mk_bidprice + tick*bidmultipy;
-		if(is_staight_insert){//直接下单
-			if(bidprice <= mk_askprice){
-				if(isclose == 1){//开仓
-					char dir[]="0";
-					char offset[] = "0";
-					pUserSpi->md_orderinsert(bidprice,dir,offset,char_inst,ordervol);
-					marketdata.append("direction=").append(dir);
-					marketdata.append("offset=").append(offset);
-					marketdata.append("price=");
-					ss << bidprice;
-					string tmpstr;
-					ss >> tmpstr;
-					marketdata.append(tmpstr);
-					marketdata.append(sep);
-					ss.clear();
-					char char_poi[6] = {'\0'};
-					sprintf(char_poi,"%d",ordervol);
-					marketdata.append("ordervol=");
-					marketdata.append(char_poi);
-					marketdata.append(sep);
-					
-				}else if(isclose == 2){//平仓
-					char dir[]="0";
-					char offset[] = "1";
-					pUserSpi->md_orderinsert(bidprice,dir,offset,char_inst,ordervol);
-					marketdata.append("direction=").append(dir);
-					marketdata.append("offset=").append(offset);
-					marketdata.append("price=");
-					ss << bidprice;
-					string tmpstr;
-					ss >> tmpstr;
-					marketdata.append(tmpstr);
-					marketdata.append(sep);
-					ss.clear();
-					char char_poi[6] = {'\0'};
-					sprintf(char_poi,"%d",ordervol);
-					marketdata.append("ordervol=");
-					marketdata.append(char_poi);
-					marketdata.append(sep);
-				}
-			}else{
-				if(isclose == 1){//开仓
-					char dir[]="0";
-					char offset[] = "0";
-					pUserSpi->md_orderinsert(mk_askprice,dir,offset,char_inst,ordervol);
-					marketdata.append("direction=").append(dir);
-					marketdata.append("offset=").append(offset);
-					marketdata.append("price=");
-					ss << mk_askprice;
-					string tmpstr;
-					ss >> tmpstr;
-					marketdata.append(tmpstr);
-					marketdata.append(sep);
-					ss.clear();
-					char char_poi[6] = {'\0'};
-					sprintf(char_poi,"%d",ordervol);
-					marketdata.append("ordervol=");
-					marketdata.append(char_poi);
-					marketdata.append(sep);
-				}else if(isclose == 2){//平仓
-					char dir[]="0";
-					char offset[] = "1";
-					pUserSpi->md_orderinsert(mk_askprice,dir,offset,char_inst,ordervol);
-					marketdata.append("direction=").append(dir);
-					marketdata.append("offset=").append(offset);
-					marketdata.append("price=");
-					ss << mk_askprice;
-					string tmpstr;
-					ss >> tmpstr;
-					marketdata.append(tmpstr);
-					marketdata.append(sep);
-					ss.clear();
-					char char_poi[6] = {'\0'};
-					sprintf(char_poi,"%d",ordervol);
-					marketdata.append("ordervol=");
-					marketdata.append(char_poi);
-					marketdata.append(sep);
-				}
-			}
-		}else{//不直接下单，要判断
-			
-			int order_vol = 0;
-			int subpositon = longTotalPosition - shortTotalPosition;
-			int yuzhi = std::abs(subpositon)/pstalarm;
-			char char_yuzhi[10] = {'\0'};
-			sprintf(char_yuzhi,"%d",yuzhi);
-			char char_sub[10]={'\0'};
-			sprintf(char_sub,"%d",subpositon);
-			//多头持仓
-			char char_long[10]={'\0'};
-			sprintf(char_long,"%d",longTotalPosition);
-			//空头持仓
-			char char_short[10]={'\0'};
-			sprintf(char_short,"%d",shortTotalPosition);
-			//买
-			char char_orderdir[] = "0";
-			//开平
-			char char_orderoffset[3]={'\0'};
-			string orderoffset;
-			//价格
-			double orderprice = 0;
-			if(subpositon >= 0){
-				if(yuzhi == 0){
-					order_vol = ordervol;
-					//价格判断
-					if(bidprice <= mk_askprice){
-						orderprice = bidprice;
-					}else{
-						orderprice = mk_askprice;//等于卖一价
-					}
-					//开平判断
-					if(isclose == 1){//开仓  
-						orderoffset = "0";
-					}else if(isclose == 2){//平仓  开仓 '0';平仓 '1';平今 '3';平昨 '4';强平 '2'
-						orderoffset = getCloseMethod();
-					}
-					strcpy(char_orderoffset,orderoffset.c_str());
-					pUserSpi->md_orderinsert(orderprice,char_orderdir,char_orderoffset,char_inst,order_vol);
-				}else{
-					order_vol = ordervol;
-					//价格判断
-					if(bidprice < mk_askprice){
-						orderprice = bidprice;
-						//开平判断
-						if(isclose == 1){//开仓
-						    orderoffset = "0";
-						}else if(isclose == 2){//平仓  开仓 '0';平仓 '1';平今 '3';平昨 '4';强平 '2'
-							orderoffset = getCloseMethod();
-						}
-						strcpy(char_orderoffset,orderoffset.c_str());
-						pUserSpi->md_orderinsert(orderprice,char_orderdir,char_orderoffset,char_inst,order_vol);
-					}
-				}
-			}else if(subpositon <= 0){//卖仓暴露风险
-				//double orderprice = 0;
-				//char char_orderdir[] = "0";
-				//char char_orderoffset[3] = {'\0'};
-				//string orderoffset;
-				if(yuzhi == 0){
-					order_vol = ordervol;
-					//价格判断
-					if(bidprice <= mk_askprice){
-						orderprice = bidprice;
-					}else{
-						orderprice = mk_askprice;//等于卖一价
-					}
-					//开平判断
-					if(isclose == 1){//开仓
-						orderoffset = "0";
-					}else if(isclose == 2){//平仓  开仓 '0';平仓 '1';平今 '3';平昨 '4';强平 '2'
-						orderoffset = getCloseMethod();
-					}
-					strcpy(char_orderoffset,orderoffset.c_str());
-					pUserSpi->md_orderinsert(orderprice,char_orderdir,char_orderoffset,char_inst,order_vol);
-				}else if(yuzhi == 1){
-					order_vol = ordervol*pstalarm - 1;
-					//价格判断
-					if(bidprice <= mk_askprice){
-						orderprice = bidprice;
-					}else{
-						orderprice = mk_askprice;//等于卖一价
-					}
-					//开平判断
-					if(isclose == 1){//开仓
-					    orderoffset = "0";
-					}else if(isclose == 2){//平仓  开仓 '0';平仓 '1';平今 '3';平昨 '4';强平 '2'
-						orderoffset = getCloseMethod();
-					}
-					strcpy(char_orderoffset,orderoffset.c_str());
-					pUserSpi->md_orderinsert(orderprice,char_orderdir,char_orderoffset,char_inst,order_vol);
-				}else if(yuzhi == 2){
-					order_vol = ordervol*pstalarm*2 - 1;
-					//价格判断
-					if(bidprice <= mk_askprice){
-					    orderprice = bidprice;
-					}else{
-					    orderprice = mk_askprice;//等于卖一价
-					}
-					//开平判断
-					if(isclose == 1){//开仓
-					    orderoffset = "0";
-					}else if(isclose == 2){//平仓
-					    orderoffset = getCloseMethod();
-					}
-					strcpy(char_orderoffset,orderoffset.c_str());
-					pUserSpi->md_orderinsert(orderprice,char_orderdir,char_orderoffset,char_inst,order_vol);
-				}else if(yuzhi > 2){
-					order_vol = ordervol*pstalarm*2 + 1;
-					//价格判断
-					orderprice = mk_askprice;//卖一价尽快成交
-					//开平判断
-					if(isclose == 1){//开仓
-					    orderoffset = "0";
-					}else if(isclose == 2){//平仓
-					    orderoffset = getCloseMethod();
-					}
-					strcpy(char_orderoffset,orderoffset.c_str());
-					pUserSpi->md_orderinsert(orderprice,char_orderdir,char_orderoffset,char_inst,order_vol);
-				}
-			}
-			marketdata.append(";卖仓=").append(char_short  );
-			marketdata.append(";买仓=").append(char_long );
-			marketdata.append(";yuzhi=").append(char_yuzhi);
-			marketdata.append(";买强持仓差=").append(char_sub);
-			marketdata.append(";direction=").append(char_orderdir);
-			marketdata.append(";offset=").append(char_orderoffset);
-			marketdata.append(";price=");
-			ss << orderprice;
-			string tmpstr;
-			ss >> tmpstr;
-			marketdata.append(tmpstr);
-			marketdata.append(sep);
-			ss.clear();
-			char char_poi[6] = {'\0'};
-			sprintf(char_poi,"%d",order_vol);
-			marketdata.append("ordervol=");
-			marketdata.append(char_poi);
-			marketdata.append(sep);
-		}	
-	}
-	if(abst >= bid_ask_spread && sprd < 0 && this_trade_vol >= trade_volume){//卖强
-		//判断用行情价格
-		double askprice = mk_askprice - tick* askmultipy;
-		if(is_staight_insert){//直接下单
-			if(askprice >= mk_bidprice){
-				if(isclose == 1){//开仓
-					char dir[]="1";
-					char offset[] = "0";
-					pUserSpi->md_orderinsert(askprice,dir,offset,char_inst,ordervol);
 
-					marketdata.append("direction=").append(dir);
-					marketdata.append("offset=").append(offset);
-					marketdata.append("price=");
-					ss << askprice;
-					string tmpstr;
-					ss >> tmpstr;
-					marketdata.append(tmpstr);
-					marketdata.append(sep);
-					ss.clear();
-					char char_poi[6] = {'\0'};
-					sprintf(char_poi,"%d",ordervol);
-					marketdata.append("ordervol=");
-					marketdata.append(char_poi);
-					marketdata.append(sep);
-				}else if(isclose == 2){//平仓
-					char dir[]="1";
-					char offset[] = "1";
-					pUserSpi->md_orderinsert(askprice,dir,offset,char_inst,ordervol);
-					marketdata.append("direction=").append(dir);
-					marketdata.append("offset=").append(offset);
-					marketdata.append("price=");
-					ss << askprice;
-					string tmpstr;
-					ss >> tmpstr;
-					marketdata.append(tmpstr);
-					marketdata.append(sep);
-					ss.clear();
-					char char_poi[6] = {'\0'};
-					sprintf(char_poi,"%d",ordervol);
-					marketdata.append("ordervol=");
-					marketdata.append(char_poi);
-					marketdata.append(sep);
-				}
-			}else{
-				if(isclose == 1){//开仓
-					char dir[]="1";
-					char offset[] = "0";
-					pUserSpi->md_orderinsert(mk_bidprice,dir,offset,char_inst,ordervol);
-					marketdata.append("direction=").append(dir);
-					marketdata.append("offset=").append(offset);
-					marketdata.append("price=");
-					ss << mk_bidprice;
-					string tmpstr;
-					ss >> tmpstr;
-					marketdata.append(tmpstr);
-					marketdata.append(sep);
-					ss.clear();
-					char char_poi[6] = {'\0'};
-					sprintf(char_poi,"%d",ordervol);
-					marketdata.append("ordervol=");
-					marketdata.append(char_poi);
-					marketdata.append(sep);
-				}else if(isclose == 2){//平仓
-					char dir[]="1";
-					char offset[] = "1";
-					pUserSpi->md_orderinsert(mk_bidprice,dir,offset,char_inst,ordervol);
-					marketdata.append("direction=").append(dir);
-					marketdata.append("offset=").append(offset);
-					marketdata.append("price=");
-					ss << mk_bidprice;
-					string tmpstr;
-					ss >> tmpstr;
-					marketdata.append(tmpstr);
-					marketdata.append(sep);
-					ss.clear();
-					char char_poi[6] = {'\0'};
-					sprintf(char_poi,"%d",ordervol);
-					marketdata.append("ordervol=");
-					marketdata.append(char_poi);
-					marketdata.append(sep);
-				}
-			}
-		}else{//不直接下单，要判断
-			int order_vol = 0;//实际下单量
-			double orderprice = 0;
-			char char_orderoffset[3] = {'\0'};
-			string orderoffset;
-			int subpositon = shortTotalPosition - longTotalPosition;
-			int yuzhi = std::abs(subpositon)/pstalarm;
-			char char_yuzhi[10] = {'\0'};
-			sprintf(char_yuzhi,"%d",yuzhi);
-			char char_sub[10]={'\0'};
-			sprintf(char_sub,"%d",subpositon);
-			char char_long[10]={'\0'};
-			sprintf(char_long,"%d",longTotalPosition);
-			char char_short[10]={'\0'};
-			sprintf(char_short,"%d",shortTotalPosition);
-			char char_orderdir[] = "1";
-			if(subpositon >= 0){//正向仓位多
-				if(yuzhi == 0){
-					order_vol = ordervol;
-					//价格判断
-					if(askprice >= mk_bidprice){
-						orderprice = askprice;
-					}else{
-						orderprice = mk_bidprice;//等于买一价
-					}
-					//开平判断
-					if(isclose == 1){//开仓
-						orderoffset = "0";
-					}else if(isclose == 2){//平仓
-						orderoffset = getCloseMethod();
-					}
-					strcpy(char_orderoffset,orderoffset.c_str());
-					pUserSpi->md_orderinsert(orderprice,char_orderdir,char_orderoffset,char_inst,order_vol);
-				}else{
-					order_vol = ordervol;
-					//价格判断
-					if(askprice > mk_bidprice){
-						orderprice = askprice;
-						//开平判断
-						if(isclose == 1){//开仓
-							orderoffset = "0";
-						}else if(isclose == 2){//平仓
-							orderoffset = getCloseMethod();
-						}
-						strcpy(char_orderoffset,orderoffset.c_str());
-						pUserSpi->md_orderinsert(orderprice,char_orderdir,char_orderoffset,char_inst,order_vol);
-					}
-				}
-			}else if(subpositon <= 0){//买仓暴露风险，卖仓增加下单量
-				if(yuzhi == 0){
-					order_vol = ordervol;
-					//价格判断
-					if(askprice >= mk_bidprice){
-						orderprice = askprice;
-					}else{
-						orderprice = mk_bidprice;//等于买一价
-					}
-					//开平判断
-					if(isclose == 1){//开仓
-						orderoffset = "0";
-					}else if(isclose == 2){//平仓
-						orderoffset = getCloseMethod();
-					}
-					strcpy(char_orderoffset,orderoffset.c_str());
-					pUserSpi->md_orderinsert(orderprice,char_orderdir,char_orderoffset,char_inst,order_vol);
-				}else if(yuzhi == 1){
-					order_vol = ordervol*pstalarm - 1;
-					//价格判断
-					if(askprice >= mk_bidprice){
-						orderprice = askprice;
-					}else{
-						orderprice = mk_bidprice;//等于买一价
-					}
-					//开平判断
-					if(isclose == 1){//开仓
-						orderoffset = "0";
-					}else if(isclose == 2){//平仓
-						orderoffset = getCloseMethod();
-					}
-					strcpy(char_orderoffset,orderoffset.c_str());
-					pUserSpi->md_orderinsert(orderprice,char_orderdir,char_orderoffset,char_inst,order_vol);
-				}else if(yuzhi == 2){
-					order_vol = ordervol*pstalarm*2 - 1;
-					//价格判断
-					if(askprice >= mk_bidprice){
-						orderprice = askprice;
-					}else{
-						orderprice = mk_bidprice;//等于买一价
-					}
-					//开平判断
-					if(isclose == 1){//开仓
-						orderoffset = "0";
-					}else if(isclose == 2){//平仓
-						orderoffset = getCloseMethod();
-					}
-					strcpy(char_orderoffset,orderoffset.c_str());
-					pUserSpi->md_orderinsert(orderprice,char_orderdir,char_orderoffset,char_inst,order_vol);
-				}else if(yuzhi > 2){
-					order_vol = ordervol*pstalarm*2 + 1;
-					//价格判断
-					orderprice = mk_bidprice;//买一价尽快成交
-					//开平判断
-					if(isclose == 1){//开仓
-						orderoffset = "0";
-					}else if(isclose == 2){//平仓
-						orderoffset = getCloseMethod();
-					}
-					strcpy(char_orderoffset,orderoffset.c_str());
-					pUserSpi->md_orderinsert(orderprice,char_orderdir,char_orderoffset,char_inst,order_vol);
-				}
-			}
-			marketdata.append(";卖仓=").append(char_short  );
-			marketdata.append(";买仓=").append(char_long );
-			marketdata.append(";yuzhi=").append(char_yuzhi);
-			marketdata.append(";卖强持仓差=").append(char_sub);
-			marketdata.append(";direction=").append(char_orderdir);
-			marketdata.append(";offset=").append(char_orderoffset);
-			marketdata.append(";price=");
-			ss << orderprice;
-			string tmpstr;
-			ss >> tmpstr;
-			marketdata.append(tmpstr);
-			marketdata.append(sep);
-			ss.clear();
-			char char_poi[6] = {'\0'};
-			sprintf(char_poi,"%d",order_vol);
-			marketdata.append("ordervol=");
-			marketdata.append(char_poi);
-			marketdata.append(sep);
-		}
-	}
+    MkDataPrice* mkdataprice = new MkDataPrice();
+    mkdataprice->setAskPrice(pDepthMarketData->AskPrice1);
+    mkdataprice->setBidPrice(pDepthMarketData->BidPrice1);
+    mkdatapricequeue.push(mkdataprice);
+
 	//处理行情
 	int64_t end1 = GetSysTimeMicros();
     string msg;
@@ -623,6 +151,7 @@ void CMdSpi::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField *pDepthMarketDa
 	marketdata.append(sep);
 	///本次成交量
 	char char_thisvol[20] = {'\0'};
+    int this_trade_vol = pDepthMarketData->Volume;
 	sprintf(char_thisvol,"%d",this_trade_vol);
 	marketdata.append("this_trade_vol=");
 	marketdata.append(char_thisvol);
@@ -787,41 +316,6 @@ void CMdSpi::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField *pDepthMarketDa
 	marketdata.append("UpdateMillisec=");
 	marketdata.append(char_ums);
 	marketdata.append(sep);
-	
-	/*
-	///申买价二
-	TThostFtdcPriceType	BidPrice2;
-	///申买量二
-	TThostFtdcVolumeType	BidVolume2;
-	///申卖价二
-	TThostFtdcPriceType	AskPrice2;
-	///申卖量二
-	TThostFtdcVolumeType	AskVolume2;
-	///申买价三
-	TThostFtdcPriceType	BidPrice3;
-	///申买量三
-	TThostFtdcVolumeType	BidVolume3;
-	///申卖价三
-	TThostFtdcPriceType	AskPrice3;
-	///申卖量三
-	TThostFtdcVolumeType	AskVolume3;
-	///申买价四
-	TThostFtdcPriceType	BidPrice4;
-	///申买量四
-	TThostFtdcVolumeType	BidVolume4;
-	///申卖价四
-	TThostFtdcPriceType	AskPrice4;
-	///申卖量四
-	TThostFtdcVolumeType	AskVolume4;
-	///申买价五
-	TThostFtdcPriceType	BidPrice5;
-	///申买量五
-	TThostFtdcVolumeType	BidVolume5;
-	///申卖价五
-	TThostFtdcPriceType	AskPrice5;
-	///申卖量五
-	TThostFtdcVolumeType	AskVolume5;
-	*/
 	///当日均价
 	marketdata.append("AveragePrice=");
 	ss << pDepthMarketData->AveragePrice;
@@ -832,6 +326,7 @@ void CMdSpi::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField *pDepthMarketDa
 	ss.clear();
 //    logmsg.setMsg(marketdata);
 //    mkdataqueue.push(&logmsg);
+
 	//处理行情
 	int64_t end2 = GetSysTimeMicros();
     auto chro_end_time = boost::chrono::high_resolution_clock::now();
@@ -852,15 +347,4 @@ bool CMdSpi::IsErrorRspInfo(CThostFtdcRspInfoField *pRspInfo)
 		cerr << "--->>> ErrorID=" << pRspInfo->ErrorID << ", ErrorMsg=" << pRspInfo->ErrorMsg << endl;
 	return bResult;
 }
-string getCloseMethod(){
-	//平仓  开仓 '0';平仓 '1';平今 '3';平昨 '4';强平 '2'
-	string orderoffset = "1";
-	if(offset_flag == 1){
-		orderoffset = "1";
-	}else if(offset_flag == 3){
-		orderoffset = "3";
-	}else if(offset_flag == 4){
-		orderoffset = "4";
-	}
-	return orderoffset;
-}
+

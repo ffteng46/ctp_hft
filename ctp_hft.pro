@@ -11,8 +11,8 @@ SOURCES += \
     globalutil.cpp \
     testTraderApi.cpp \
     boost_tools.cpp
-INCLUDEPATH += ../../boost_1_62_0
-LIBS += -L/home/tff/software/boost_1_62_0/stage/lib
+INCLUDEPATH += ../../boost_1_61_0
+LIBS += -L../../boost_1_61_0/stage/lib
 LIBS += -L../../ctp/ -lthosttraderapi -lthostmduserapi
 LIBS += -lboost_system -lboost_thread -lthosttraderapi -lthostmduserapi -lpthread -lboost_chrono -lglog -lboost_locale
 HEADERS += \

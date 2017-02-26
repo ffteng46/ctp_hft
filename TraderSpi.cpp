@@ -1,4 +1,4 @@
-#include <iostream>
+﻿#include <iostream>
 
 
 #include "../../ctp/ThostFtdcTraderApi.h"
@@ -29,18 +29,17 @@ extern TThostFtdcPriceType	LIMIT_PRICE;	// 价格;
 extern TThostFtdcDirectionType	DIRECTION;	// 买卖方向;
 extern int orderref;
 extern double tick;
-extern int isclose;
-extern int offset_flag;
+int isclose=0;
+int offset_flag = 0;
 extern int limit_volume;
-//卖出价格振幅
-extern int tickSpreadSell;
-//买入价格振幅
-extern int tickSpreadBuy;
 // 请求编号;
 extern int iRequestID;
 ///日志消息队列
 //extern list<string> loglist;
-
+//跌停价格
+extern double min_price;
+//涨停价格
+extern double max_price;
 //未成功录入报单
 vector<CThostFtdcInputOrderField*> vecFailedHedgeOrderInsert;
 //对冲报单录入列表
@@ -56,7 +55,7 @@ bool isTradeDefFieldReady = false;
 //用户对冲报单文件是否已经写入定义字段
 bool isOrderInsertDefFieldReady = false;
 //将成交信息组装成对冲报单
-CThostFtdcInputOrderField assamble(CThostFtdcTradeField *pTrade);
+CThostFtdcInputOrderField* assamble(CThostFtdcOrderField *pTrade);
 ////将投资者对冲报单信息写入文件保存
 void saveInvestorOrderInsertHedge(CThostFtdcInputOrderField *order,string filepath);
 //保存报单回报信息
@@ -81,6 +80,7 @@ int storeInvestorPosition(CThostFtdcInvestorPositionField *pInvestorPosition);
 string storeInvestorTrade(CThostFtdcTradeField *pTrade);
 //c处理成交 
 int processtrade(CThostFtdcTradeField *pTrade);
+void tradeParaProcessTwo();
 //初始化持仓信息
 void initpst(CThostFtdcInvestorPositionField *pInvestorPosition);
 int ret = 0;
@@ -93,11 +93,51 @@ extern string str_front_id;
 extern string str_sessioin_id;
 extern bool isrtntradeprocess;
 extern boost::lockfree::queue<LogMsg*> logqueue;
+extern char singleInstrument[30];
+
+//买平标志,1开仓；2平仓
+extern int longPstIsClose;
+extern int shortPstIsClose;
 //positionmap可重入锁
 boost::recursive_mutex pst_mtx;
 //orderinsertkey与ordersysid对应关系锁
 boost::recursive_mutex order_mtx;
+//action order lock
+boost::recursive_mutex actionOrderMTX;
+//longpstlimit
+extern int longpstlimit;
+//shortpstlimit
+extern int shortpstlimit;
 //记录时间 
+extern int long_offset_flag;
+extern int short_offset_flag;
+//卖出报单触发信号
+extern int askCulTimes;
+//买入报单触发信号
+extern int bidCulTimes;
+//上涨
+extern int up_culculate;
+//下跌
+extern int down_culculate;
+//报单触发信号
+extern int cul_times;
+int realLongPstLimit = 0;
+int realShortPstLimit = 0;
+int lastABSSpread = 0;
+int firstGap = 2;
+int secondGap = 5;
+boost::atomic_int32_t orderID(0);
+//delayed ask order map
+unordered_map<double,unordered_map<string,int32_t>> delayedAskOrderMap;
+unordered_map<double,unordered_map<string,int32_t>> delayedBidOrderMap;
+//all delayed order
+unordered_map<int,CThostFtdcInputOrderField*> allDelayedOrder;
+int CTraderSpi::md_orderinsert(CThostFtdcInputOrderField* req){
+    int nRequestID = ++iRequestID;
+    int iResult = pUserApi->ReqOrderInsert(req,nRequestID);
+    cerr << "--->>> ReqOrderInsert:" << ((iResult == 0) ? "成功" : "失败") << endl;
+}
+
 int CTraderSpi::md_orderinsert(double price,char *dir,char *offset,char * ins,int ordervolume){
 	char InstrumentID[31];
 	strcpy(InstrumentID,ins);
@@ -282,7 +322,8 @@ void CTraderSpi::OnRspUserLogin(CThostFtdcRspUserLoginField *pRspUserLogin,
 		///投资者结算结果确认;
         cout<<msg<<endl;
         //ReqSettlementInfoConfirm();
-        ReqQryInvestorPosition();
+        //ReqQryInvestorPosition();
+        ReqQryTradingAccount();
 		//this->ReqOrderInsert();
 		///请求查询合约
 		//ReqQryInstrument();
@@ -330,7 +371,7 @@ void CTraderSpi::OnRspSettlementInfoConfirm(CThostFtdcSettlementInfoConfirmField
         cout<<str<<endl;
 		//writeStr(str);
 		///请求账号信息
-		ReqQryTradingAccount();
+        //ReqQryTradingAccount();
 	}
 }
 
@@ -338,7 +379,7 @@ void CTraderSpi::ReqQryInstrument()
 {
 	CThostFtdcQryInstrumentField req;
 	memset(&req, 0, sizeof(req));
-	strcpy(req.InstrumentID, INSTRUMENT_ID);
+    strcpy(req.InstrumentID,singleInstrument);
 	//strcpy(req.ExchangeID,"CFFEX");
 	int iResult = pUserApi->ReqQryInstrument(&req, ++iRequestID);
 	cerr << "--->>> 请求查询合约: " << ((iResult == 0) ? "成功" : "失败") << endl;
@@ -351,13 +392,19 @@ void CTraderSpi::OnRspQryInstrument(CThostFtdcInstrumentField *pInstrument, CTho
 	str.append( "--->>> OnRspQryInstrument\n");
 	if (bIsLast && !IsErrorRspInfo(pRspInfo))
 	{
+        tick = pInstrument->PriceTick;
+//        min_price = pInstrument->LowerLimitPrice;
+//        max_price = pInstrument->UpperLimitPrice;
+        querySleep();
+        ReqQryInvestorPosition();
 		str.append("exchangeid=");
 		str.append(pInstrument->ExchangeID);
-		str.append(" ,ExchangeInstID=");
-		str.append(pInstrument->ExchangeInstID);
+        str.append(" ,InstrumentID=");
+        str.append(pInstrument->InstrumentID);
+        cout<<str<<endl;
 		writeStr(str);
 		///请求查询合约
-		ReqQryTradingAccount();
+
 	}
 }
 
@@ -383,22 +430,29 @@ void CTraderSpi::OnRspQryTradingAccount(CThostFtdcTradingAccountField *pTradingA
 	cerr << "--->>> " << "OnRspQryTradingAccount" << endl;
 	if (bIsLast && !IsErrorRspInfo(pRspInfo))
 	{
-		string str;
-        str.append(boosttoolsnamespace::CBoostTools::gbktoutf8("--->>> OnRspQryTradingAccount:查询投资者账户信息成功\n"));
-		str.append(pTradingAccount->BrokerID);
-		str.append("\t");
-		str.append(pTradingAccount->AccountID);
-		str.append("\t");
-		char a[100],b[100];
-		sprintf(a,"%f",pTradingAccount->Available);
-		sprintf(b,"%f",pTradingAccount->ExchangeMargin);
-		str.append("Available=").append(a);
-		str.append("\t");
-		str.append("ExchangeMargin=").append(b);
-        LOG(INFO)<<str;
-        cout<<str<<endl;
-		///请求查询投资者持仓
-		ReqQryInvestorPosition();
+        printf("-----------------------------\n");
+//        printf("投资者编号=[%s]\n",pTradingAccount->InvestorID);
+        printf("资金帐号=[%s]\n",pTradingAccount->AccountID);
+        printf("上次结算准备金=[%lf]\n",pTradingAccount->PreBalance);
+        printf("入金金额=[%lf]\n",pTradingAccount->Deposit);
+        printf("出金金额=[%lf]\n",pTradingAccount->Withdraw);
+        printf("冻结的保证金=[%lf]\n",pTradingAccount->FrozenMargin);
+//        printf("冻结手续费=[%lf]\n",pTradingAccount->FrozenFee);
+        printf("手续费=[%lf]\n",pTradingAccount->Commission);
+        printf("平仓盈亏=[%lf]\n",pTradingAccount->CloseProfit);
+        printf("持仓盈亏=[%lf]\n",pTradingAccount->PositionProfit);
+        printf("可用资金=[%lf]\n",pTradingAccount->Available);
+//        printf("多头冻结的保证金=[%lf]\n",pTradingAccount->LongFrozenMargin);
+//        printf("空头冻结的保证金=[%lf]\n",pTradingAccount->ShortFrozenMargin);
+//        printf("多头保证金=[%lf]\n",pTradingAccount->LongMargin);
+//        printf("空头保证金=[%lf]\n",pTradingAccount->ShortMargin);
+        printf("-----------------------------\n");
+        querySleep();
+        ReqQryInstrument();
+//        LOG(INFO)<<str;
+//        cout<<str<<endl;
+//		///请求查询投资者持仓
+//		ReqQryInvestorPosition();
 	}
 }
 
@@ -431,19 +485,46 @@ void CTraderSpi::OnRspQryInvestorPosition(CThostFtdcInvestorPositionField *pInve
 
 		int isbeginmk = 0;
         unordered_map<string,unordered_map<string,int>>::iterator tmpit = positionmap.begin();
-		for(;tmpit != positionmap.end();tmpit ++){
-			string str_instrument = tmpit->first;
-            unordered_map<string,int> tmppst = tmpit->second;
-			int longpst = tmppst["longTotalPosition"];
-			int shortpst = tmppst["shortTotalPosition"];
-			char char_longpst[12] = {'\0'};
-			char char_shortpst[12] = {'\0'};
-			sprintf(char_longpst,"%d",longpst);
-			sprintf(char_shortpst,"%d",shortpst);
-            string pst_msg = "持仓结构:"+str_instrument + ",多头持仓量=" + string(char_longpst) + ",空头持仓量=" + string(char_shortpst) ;
-			cout<<pst_msg<<endl;
-            LOG(INFO)<<pst_msg;
-		}
+        if(tmpit == positionmap.end()){
+            cout<<"当前无持仓信息"<<endl;
+        }else{
+            for(;tmpit != positionmap.end();tmpit ++){
+                string str_instrument = tmpit->first;
+                unordered_map<string,int> tmppst = tmpit->second;
+                char char_tmp_pst[10] = {'\0'};
+                char char_longyd_pst[10] = {'\0'};
+                char char_longtd_pst[10] = {'\0'};
+                sprintf(char_tmp_pst,"%d",tmppst["longTotalPosition"]);
+                sprintf(char_longyd_pst,"%d",tmppst["longYdPosition"]);
+                sprintf(char_longtd_pst,"%d",tmppst["longTdPosition"]);
+                char char_tmp_pst2[10] = {'\0'};
+                char char_shortyd_pst[10] = {'\0'};
+                char char_shorttd_pst[10] = {'\0'};
+                sprintf(char_tmp_pst2,"%d",tmppst["shortTotalPosition"]);
+                sprintf(char_shortyd_pst,"%d",tmppst["shortYdPosition"]);
+                sprintf(char_shorttd_pst,"%d",tmppst["shortTdPosition"]);
+                if(tmppst["longYdPosition"] > 0){
+                    shortPstIsClose = 2;
+                    short_offset_flag = 4;
+                }
+                if(tmppst["shortYdPosition"] > 0){
+                    longPstIsClose = 2;
+                    long_offset_flag = 4;
+                }
+//                int longpst = tmppst["longTotalPosition"];
+//                int shortpst = tmppst["shortTotalPosition"];
+//                char char_longpst[12] = {'\0'};
+//                char char_shortpst[12] = {'\0'};
+//                sprintf(char_longpst,"%d",longpst);
+//                sprintf(char_shortpst,"%d",shortpst);
+                string pst_msg = "持仓结构:"+str_instrument + ",多头持仓量=" + string(char_tmp_pst) + ",今仓数量=" + string(char_longtd_pst) + ",昨仓数量=" + string(char_longyd_pst) +
+                        ";空头持仓量=" + string(char_tmp_pst2) + ",今仓数量=" + string(char_shorttd_pst) + ",昨仓数量=" + string(char_shortyd_pst) ;
+                cout<<pst_msg<<endl;
+                LOG(INFO)<<pst_msg;
+            }
+        }
+        //call tradeParaProcess method to set close or open
+        tradeParaProcessTwo();
 		cout<<"是否启动策略程序?0 否，1是"<<endl;
 		cin>>isbeginmk;
 		if(isbeginmk == 1){
@@ -483,6 +564,7 @@ void CTraderSpi::ReqOrderInsert(CThostFtdcInputOrderField order)
 //2、交易所响应进行修改，把requestid主键修改为ordersysid
 void CTraderSpi::OnRspOrderInsert(CThostFtdcInputOrderField *pInputOrder, CThostFtdcRspInfoField *pRspInfo, int nRequestID, bool bIsLast)
 {
+    cout<<"------->>OnRspOrderInsert"<<endl;
 	if (pRspInfo != NULL && IsErrorRspInfo(pRspInfo))
 	{
 		cerr << "--->>> " << "OnRspOrderInsert" << "响应请求编号："<<nRequestID<< " CTP回报请求编号"<<pInputOrder->RequestID<<endl;
@@ -514,31 +596,36 @@ void CTraderSpi::OnRspOrderInsert(CThostFtdcInputOrderField *pInputOrder, CThost
 ///请求查询报单响应
 void CTraderSpi::OnRspQryOrder(CThostFtdcOrderField *pOrder, CThostFtdcRspInfoField *pRspInfo, int nRequestID, bool bIsLast) 
 {
-
+    cout<<"------->OnRspQryOrder>"<<endl;
 }
 
 ///报单录入错误回报
 void CTraderSpi::OnErrRtnOrderInsert(CThostFtdcInputOrderField *pInputOrder, CThostFtdcRspInfoField *pRspInfo)
 {
-
-    string sInputOrderInfo = getInvestorOrderInsertInfo(pInputOrder);
-
-    string sResult;
-    char cErrorID[20] ;
-//	itoa(pRspInfo->ErrorID,cErrorID,10);
-    sprintf(cErrorID,"%d",pRspInfo->ErrorID);
-    cout<<"hello"<<endl;
-    sResult.append("交易所报单录入错误回报--->>> ErrorID=");
-    sResult.append(cErrorID);
-    sResult.append(", ErrorMsg=");
-    sResult.append(boosttoolsnamespace::CBoostTools::gbktoutf8(pRspInfo->ErrorMsg));
-    sInputOrderInfo.append(sResult);
-    //记录错误回报报单信息
-    LOG(INFO)<<sInputOrderInfo;
-    //write(sInputOrderInfo,"exchangeRtnOrderInsertError.txt");
-    //记录错误信息
-
-//    IsErrorRspInfo(sInputOrderInfo);
+    cout<<"------->OnErrRtnOrderInsert>"<<endl;
+   // string sInputOrderInfo = getInvestorOrderInsertInfo(pInputOrder);
+    if (pRspInfo != NULL && IsErrorRspInfo(pRspInfo))
+    {
+        string sInputOrderInfo = getInvestorOrderInsertInfo(pInputOrder);
+        string sResult;
+        char cErrorID[10]={'\0'};
+//		itoa(pRspInfo->ErrorID,cErrorID,10);
+        sprintf(cErrorID,"%d",pRspInfo->ErrorID);
+        char cRequestid[100];
+        char ctpRequestId[100];
+        sprintf(ctpRequestId,"%d",pInputOrder->RequestID);
+        sResult.append("CTP报单回报信息--->>> ErrorID=");
+        sResult.append(cErrorID);
+        sResult.append(", ErrorMsg=");
+        sResult.append(boosttoolsnamespace::CBoostTools::gbktoutf8(pRspInfo->ErrorMsg));
+        sInputOrderInfo.append(sResult);
+        sInputOrderInfo.append("响应请求编号nRequestID：");
+        sInputOrderInfo.append(cRequestid);
+        sInputOrderInfo.append( " CTP回报请求编号pInputOrder->RequestID:");
+        sInputOrderInfo.append(ctpRequestId);
+        //记录失败的对冲报单
+        LOG(INFO)<<sInputOrderInfo;
+    }
 }
 
 void CTraderSpi::ReqOrderAction(CThostFtdcOrderField *pOrder)
@@ -592,11 +679,69 @@ void CTraderSpi::OnRspOrderAction(CThostFtdcInputOrderActionField *pInputOrderAc
 ///报单通知
 void CTraderSpi::OnRtnOrder(CThostFtdcOrderField *pOrder)
 {
+    /////买
+//#define THOST_FTDC_D_Buy '0'
+///卖
+//#define THOST_FTDC_D_Sell '1'
 	cerr << "--->>> " << "OnRtnOrder"  << "交易所回报请求编号："<<pOrder->RequestID<<endl;
-	
+//    char orderSysID[25];
+//    strcpy(orderSysID,pOrder->OrderSysID);
     string msg = "OnRtnOrder:";
     msg.append(getRtnOrder(pOrder));
     LOG(INFO)<<msg;
+    ///撤单
+    // #define THOST_FTDC_OST_Canceled '5'
+    char c_order_status[5] = "5";
+    int isActionOrder = strcmp(&pOrder->OrderStatus,c_order_status);
+    if(isActionOrder != 0){// not action order,do not assemble order
+        cout<<"normal onRtnOrder,do not assemble order"<<endl;
+        return;
+    }
+    CThostFtdcInputOrderField* order = assamble(pOrder);
+    //order will be insert,which store in askordermap or bidordermap
+    int32_t tmp_orderID = orderID;
+    orderID += 1;
+
+    char c_dir_buy[5] = "0";
+    char c_dir_sell[5] = "1";
+    //order direction
+    int dir_buy = strcmp(&order->Direction,c_dir_buy);
+    int dir_sell = strcmp(&order->Direction,c_dir_sell);
+
+    //volume which order been action
+    int32_t tmp_vol = order->VolumeTotalOriginal;
+    //order price
+    double tmp_price = order->LimitPrice;
+
+    boost::recursive_mutex::scoped_lock SLock(actionOrderMTX);
+    if(dir_buy == 0){//buy direction
+        unordered_map<double,unordered_map<string,int32_t>>::iterator it = delayedBidOrderMap.find(tmp_price);
+        if(it == delayedBidOrderMap.end()){//new create
+            unordered_map<string,int32_t> tmp_order_map;
+            tmp_order_map["orderID"] = tmp_orderID;
+            tmp_order_map["volume"] = tmp_vol;
+            delayedBidOrderMap[tmp_price] = tmp_order_map;
+            allDelayedOrder[tmp_orderID] = order;
+        }else{//update data
+            unordered_map<string,int32_t> bid_order_map = it->second;
+            //modify order volume
+            unordered_map<string,int32_t>::iterator bidVol_it = bid_order_map.find("volume");
+            bidVol_it->second = bidVol_it->second + tmp_vol;
+        }
+    }else if(dir_sell == 0){//sell direction order action
+        unordered_map<double,unordered_map<string,int32_t>>::iterator it = delayedAskOrderMap.find(tmp_price);
+        if(it == delayedAskOrderMap.end()){//new create ask order
+            unordered_map<string,int32_t> tmp_order_map;
+            tmp_order_map["orderID"] = tmp_orderID;
+            tmp_order_map["volume"] = tmp_vol;
+            delayedAskOrderMap[tmp_price] = tmp_order_map;
+            allDelayedOrder[tmp_orderID] = order;
+        }else{
+            //modify order volume
+            it->second["volume"] = it->second["volume"] + tmp_vol;
+        }
+    }
+
 }
 
 ///成交通知
@@ -607,13 +752,13 @@ void CTraderSpi::OnRtnTrade(CThostFtdcTradeField *pTrade)
 	//处理持仓
     int64_t start = GetSysTimeMicros();
     //auto start = boost::chrono::high_resolution_clock::now();
-	char* ordersysid = pTrade->OrderSysID;
+    char* ordersysid = pTrade->OrderSysID;
     string str_ordersysid = boost::trim_copy(string(ordersysid));
-	if(seq_map_ordersysid.find(str_ordersysid) != seq_map_ordersysid.end()){
+    if(seq_map_ordersysid.find(str_ordersysid) != seq_map_ordersysid.end()){
         string tmpstr = "error:查询不到ordersysid="+str_ordersysid+" 的报单信息";
          LOG(INFO)<<tmpstr;
-	}else if(isrtntradeprocess){
-		//根据ordersysid查询orderinsertkey
+    }else if(isrtntradeprocess){
+        //根据ordersysid查询orderinsertkey
 //        unordered_map<string,string>::iterator tmpit = seq_map_ordersysid.find(str_ordersysid);
 //		string orderinsertkey = tmpit->second;
 //		if(orderinsertkey.size() != 0){
@@ -634,7 +779,7 @@ void CTraderSpi::OnRtnTrade(CThostFtdcTradeField *pTrade)
 //			}
 //             LOG(INFO)<<str_time_msg;
 //		}
-	}
+    }
 	processtrade(pTrade);
     int64_t end1 = GetSysTimeMicros();
 	string tradeInfo = storeInvestorTrade(pTrade);
@@ -681,35 +826,47 @@ void CTraderSpi::OnRspError(CThostFtdcRspInfoField *pRspInfo, int nRequestID, bo
 
 bool CTraderSpi::IsErrorRspInfo(CThostFtdcRspInfoField *pRspInfo)
 {
+    cout<<"--->>IsErrorRspInfo"<<endl;
+    CThostFtdcRspInfoField *pRspInfo2 = (CThostFtdcRspInfoField*)pRspInfo;
 	// 如果ErrorID != 0, 说明收到了错误的响应
-	bool bResult = ((pRspInfo) && (pRspInfo->ErrorID != 0));
+    printf("%p\n",pRspInfo);
+    char c_pid[20];
+    sprintf(c_pid,"%p",pRspInfo);
+    cout<<c_pid<<endl;
+    int d = strcmp(c_pid,"0x31");
+    printf("%d\n",d);
+    if(d == 0){
+        cout<<"error rspinfo"<<endl;
+        return false;
+    }
+    bool bResult = ((pRspInfo) && (pRspInfo2->ErrorID != 0));
     cout<<"iserror"<<bResult<<" "<< pRspInfo<<endl;
 //    string errmsg = boosttoolsnamespace::CBoostTools::gbktoutf8(pRspInfo->ErrorMsg);
 
     char char_msg[1024]={'\0'};
 	if (bResult){
-        string errmsg =pRspInfo->ErrorMsg;
+        string errmsg =boosttoolsnamespace::CBoostTools::gbktoutf8(pRspInfo->ErrorMsg);
 		if(pRspInfo->ErrorID == 22){//重复的ref
 			orderref += 1000;
             cerr << "--->>> ErrorID=" << pRspInfo->ErrorID << ", ErrorMsg=" << errmsg <<",orderref增加="<<orderref<<endl;
-			sprintf(char_msg, "--->>> ErrorID=%d,ErrorMsg=%s,orderref增加=%d",pRspInfo->ErrorID,  pRspInfo->ErrorMsg,orderref);
+            sprintf(char_msg, "--->>> ErrorID=%d,ErrorMsg=%s,orderref增加=%d",pRspInfo->ErrorID,  errmsg,orderref);
 
         }else if(pRspInfo->ErrorID == 31){//资金不足
 			isclose = 2;
             cerr << "--->>> ErrorID=" << pRspInfo->ErrorID << ", ErrorMsg=" << errmsg <<",isclose平仓开仓方式修改为:"<<isclose<<endl;
-			sprintf(char_msg, "--->>> ErrorID=%d,ErrorMsg=%s,isclose平仓开仓方式修改为:%d",pRspInfo->ErrorID,  pRspInfo->ErrorMsg,isclose);
+            sprintf(char_msg, "--->>> ErrorID=%d,ErrorMsg=%s,isclose平仓开仓方式修改为:%d",pRspInfo->ErrorID,  errmsg,isclose);
         }else if(pRspInfo->ErrorID == 30){//平仓量超过持仓量
 			isclose = 1;
             cerr << "--->>> ErrorID=" << pRspInfo->ErrorID << ", ErrorMsg=" << errmsg <<",isclose平仓开仓方式修改为:"<<isclose<<endl;
-			sprintf(char_msg, "--->>> ErrorID=%d,ErrorMsg=%s,isclose平仓开仓方式修改为:%d",pRspInfo->ErrorID,  pRspInfo->ErrorMsg,isclose);
+            sprintf(char_msg, "--->>> ErrorID=%d,ErrorMsg=%s,isclose平仓开仓方式修改为:%d",pRspInfo->ErrorID, errmsg,isclose);
         }else if(pRspInfo->ErrorID == 51){//平昨仓位不足
 			offset_flag = 3;
             cerr << "--->>> ErrorID=" << pRspInfo->ErrorID << ", ErrorMsg=" << errmsg <<",平仓方式修改为平今:"<<offset_flag<<endl;
-			sprintf(char_msg, "--->>> ErrorID=%d,ErrorMsg=%s,平仓方式修改为平今:%d",pRspInfo->ErrorID,  pRspInfo->ErrorMsg,offset_flag);
+            sprintf(char_msg, "--->>> ErrorID=%d,ErrorMsg=%s,平仓方式修改为平今:%d",pRspInfo->ErrorID,errmsg,offset_flag);
         }else if(pRspInfo->ErrorID == 50){//平今仓位不足
 			isclose = 1;
             cerr << "--->>> ErrorID=" << pRspInfo->ErrorID << ", ErrorMsg=" << errmsg <<",isclose平仓开仓方式修改为:"<<isclose<<endl;
-			sprintf(char_msg, "--->>> ErrorID=%d,ErrorMsg=%s,isclose平仓开仓方式修改为:%d",pRspInfo->ErrorID,  pRspInfo->ErrorMsg,isclose);
+            sprintf(char_msg, "--->>> ErrorID=%d,ErrorMsg=%s,isclose平仓开仓方式修改为:%d",pRspInfo->ErrorID,errmsg,isclose);
         }else if(pRspInfo->ErrorID == 3){//不合法的登录
             cerr << "--->>> ErrorID=" << pRspInfo->ErrorID << ", ErrorMsg=" << errmsg <<endl;
             sprintf(char_msg, "--->>> ErrorID=%d,ErrorMsg=%s",pRspInfo->ErrorID,errmsg);
@@ -719,7 +876,7 @@ bool CTraderSpi::IsErrorRspInfo(CThostFtdcRspInfoField *pRspInfo)
             sprintf(char_msg, "--->>> ErrorID=%d,ErrorMsg=%s",pRspInfo->ErrorID,  boosttoolsnamespace::CBoostTools::gbktoutf8(pRspInfo->ErrorMsg));
         }
         string msg(char_msg);
-        cout<<"----------"<<msg<<endl;
+        cout<<"----------"<<char_msg<<endl;
         LOG(INFO)<<msg;
 	}
 	return bResult;
@@ -1331,115 +1488,287 @@ int processtrade(CThostFtdcTradeField *pTrade)
     //锁持仓处理
     boost::recursive_mutex::scoped_lock SLock(pst_mtx);
     unordered_map<string,unordered_map<string,int>>::iterator map_iterator = positionmap.find(str_inst);
-	//新开仓
-	if(map_iterator == positionmap.end()){
+    //新开仓
+    if(map_iterator == positionmap.end()){
         unordered_map<string,int> tmpmap;
-		if(str_dir == "0"){//买
-			tmpmap["longTotalPosition"] = pTrade->Volume;
-			tmpmap["shortTotalPosition"] = 0;
-		}else if(str_dir == "1"){//卖
-			tmpmap["longTotalPosition"] = 0;
-			tmpmap["shortTotalPosition"] = pTrade->Volume;
-		}
-		positionmap[str_inst] = tmpmap;
-	}else{
-		int tmplimitvol = 0;
-		if(str_dir == "0"){//买
-			if(str_offset == "0"){//买开仓,多头增加
-				int tmp_num = map_iterator->second["longTotalPosition"];
-				tmplimitvol = tmp_num;
-				map_iterator->second["longTotalPosition"] = tmp_num + pTrade->Volume;
-			}else if(str_offset == "1" || str_offset == "3"||str_offset == "4"){//买平仓,空头减少
-				int tmp_num = map_iterator->second["shortTotalPosition"];
-				tmplimitvol = tmp_num;
-				map_iterator->second["shortTotalPosition"] = tmp_num - pTrade->Volume;
-			}
-		}else if(str_dir == "1"){//卖
-			if(str_offset == "0"){//卖开仓,空头增加
-				int tmp_num = map_iterator->second["shortTotalPosition"];
-				tmplimitvol = tmp_num;
-				map_iterator->second["shortTotalPosition"] = tmp_num + pTrade->Volume;
-			}else if(str_offset == "1" || str_offset == "3"||str_offset == "4"){//卖平仓,多头减少
-				int tmp_num = map_iterator->second["longTotalPosition"];
-				tmplimitvol = tmp_num;
-				map_iterator->second["longTotalPosition"] = tmp_num - pTrade->Volume;
-			}
-		}
-		if(tmplimitvol > limit_volume){
-			isclose = 2;
-			char char_limit[10] = {'\0'};
-			sprintf(char_limit,"%d",tmplimitvol);
-			string tmpmsg= "持仓量=";
-			tmpmsg.append(char_limit).append("大于limit_volume,修改为平仓");
-            LOG(INFO)<<tmpmsg;
-		}
-	}
-	string tmpmsg;
+        if(str_dir == "0"){//买
+            //多头
+            tmpmap["longTdPosition"] = pTrade->Volume;
+            tmpmap["longYdPosition"] = 0;
+            tmpmap["longTotalPosition"] = pTrade->Volume;
+            //空头
+            tmpmap["shortTdPosition"] = 0;
+            tmpmap["shortYdPosition"] = 0;
+            tmpmap["shortTotalPosition"] = 0;
+        }else if(str_dir == "1"){//卖
+            //空头
+            tmpmap["shortTdPosition"] = pTrade->Volume;
+            tmpmap["shortYdPosition"] = 0;
+            tmpmap["shortTotalPosition"] = pTrade->Volume;
+            //多头
+            tmpmap["longTdPosition"] = 0;
+            tmpmap["longYdPosition"] = 0;
+            tmpmap["longTotalPosition"] = 0;
+        }
+        positionmap[str_inst] = tmpmap;
+    }else{
+        ///平仓
+//        #define USTP_FTDC_OF_Close '1'
+//        ///强平
+//        #define USTP_FTDC_OF_ForceClose '2'
+//        ///平今
+//        #define USTP_FTDC_OF_CloseToday '3'
+//        ///平昨
+//        #define USTP_FTDC_OF_CloseYesterday '4'
+        if(str_dir == "0"){//买
+            if(str_offset == "0"){//买开仓,多头增加
+                map_iterator->second["longTdPosition"] = map_iterator->second["longTdPosition"] + pTrade->Volume;
+                int tmp_tdpst = map_iterator->second["longTdPosition"];
+                int tmp_ydpst = map_iterator->second["longYdPosition"];
+                realLongPstLimit = tmp_tdpst + tmp_ydpst;
+                map_iterator->second["longTotalPosition"] = realLongPstLimit;
+            }else if(str_offset == "1" ){//买平仓,空头减少
+                int tmp_tdpst = map_iterator->second["shortTdPosition"];
+                int tmp_ydpst = map_iterator->second["shortYdPosition"];
+                //int tmp_num = map_iterator->second["shortTotalPosition"];
+                if(tmp_tdpst > 0){
+                    if(tmp_tdpst <= pTrade->Volume){
+                        tmp_ydpst = tmp_ydpst - (pTrade->Volume - tmp_tdpst);
+                        tmp_tdpst = 0;
+                    }else{
+                        tmp_tdpst = tmp_tdpst - pTrade->Volume;
+                    }
+                }else if(tmp_tdpst == 0){
+                    tmp_ydpst = tmp_ydpst - pTrade->Volume;
+                }else{
+                    cout<<"tdposition is error!!!"<<endl;
+                }
+                realShortPstLimit = tmp_ydpst + tmp_tdpst;
+                map_iterator->second["shortTdPosition"] = tmp_tdpst;
+                map_iterator->second["shortYdPosition"] = tmp_ydpst;
+                map_iterator->second["shortTotalPosition"] = realShortPstLimit;
+//                if(tmp_ydpst == 0){//buy open
+//                    longPstIsClose = 1;
+//                    long_offset_flag = 1;
+//                }
+            }else if(str_offset == "3"){//平今
+                int tmp_tdpst = map_iterator->second["shortTdPosition"];
+                int tmp_ydpst = map_iterator->second["shortYdPosition"];
+                tmp_tdpst = tmp_tdpst - pTrade->Volume;
+                realShortPstLimit = tmp_ydpst + tmp_tdpst;
+                map_iterator->second["shortTdPosition"] = tmp_tdpst;
+                map_iterator->second["shortTotalPosition"] = realShortPstLimit;
+            }else if(str_offset == "4"){//平昨
+                int tmp_tdpst = map_iterator->second["shortTdPosition"];
+                int tmp_ydpst = map_iterator->second["shortYdPosition"];
+                if(tmp_ydpst == 0){
+                    char c_err[100];
+                    sprintf(c_err,"shortYdPosition is zero!!!,please check this rtn trade.");
+                    cout<<c_err<<endl;
+                    LOG(INFO)<<c_err;
+                }
+                tmp_ydpst = tmp_ydpst - pTrade->Volume;
+
+                realShortPstLimit = tmp_ydpst + tmp_tdpst;
+                map_iterator->second["shortYdPosition"] = tmp_ydpst;
+                map_iterator->second["shortTotalPosition"] = realShortPstLimit;
+//                if(tmp_ydpst == 0){
+//                    longPstIsClose = 1;
+//                    long_offset_flag = 1;
+//                }
+            }
+        }else if(str_dir == "1"){//卖
+            if(str_offset == "0"){//卖开仓,空头增加
+                map_iterator->second["shortTdPosition"] = map_iterator->second["shortTdPosition"] + pTrade->Volume;
+                int tmp_tdpst = map_iterator->second["shortTdPosition"];
+                int tmp_ydpst = map_iterator->second["shortYdPosition"];
+                realShortPstLimit = tmp_tdpst + tmp_ydpst;
+                map_iterator->second["shortTotalPosition"] = realShortPstLimit;
+            }else if(str_offset == "1"){//卖平仓,多头减少
+                int tmp_tdpst = map_iterator->second["longTdPosition"];
+                int tmp_ydpst = map_iterator->second["longYdPosition"];
+                //int tmp_num = map_iterator->second["longTotalPosition"];
+                if(tmp_tdpst > 0){
+                    if(tmp_tdpst <= pTrade->Volume){
+                        tmp_ydpst = tmp_ydpst - (pTrade->Volume - tmp_tdpst);
+                        tmp_tdpst = 0;
+                    }else{
+                        tmp_tdpst = tmp_tdpst - pTrade->Volume;
+                    }
+                }else if(tmp_tdpst == 0){
+                    tmp_ydpst = tmp_ydpst - pTrade->Volume;
+                }else{
+                    cout<<"tdposition is error!!!"<<endl;
+                }
+                realLongPstLimit = tmp_ydpst + tmp_tdpst;
+                map_iterator->second["longTdPosition"] = tmp_tdpst;
+                map_iterator->second["longYdPosition"] = tmp_ydpst;
+                map_iterator->second["longTotalPosition"] = realLongPstLimit;
+//                if(tmp_ydpst == 0){//sell open
+//                    shortPstIsClose = 1;
+//                    short_offset_flag = 1;
+//                }
+            }else if(str_offset == "3"){//平今
+                int tmp_tdpst = map_iterator->second["longTdPosition"];
+                int tmp_ydpst = map_iterator->second["longYdPosition"];
+                tmp_tdpst = tmp_tdpst - pTrade->Volume;
+                realLongPstLimit = tmp_ydpst + tmp_tdpst;
+                map_iterator->second["longTdPosition"] = tmp_tdpst;
+                map_iterator->second["longTotalPosition"] = realLongPstLimit;
+            }else if(str_offset == "4"){//平昨
+                int tmp_tdpst = map_iterator->second["longTdPosition"];
+                int tmp_ydpst = map_iterator->second["longYdPosition"];
+                if(tmp_ydpst == 0){
+                    char c_err[100];
+                    sprintf(c_err,"longYdPosition is zero!!!,please check this rtn trade.");
+                    cout<<c_err<<endl;
+                    LOG(INFO)<<c_err;
+                }
+                tmp_ydpst = tmp_ydpst - pTrade->Volume;
+                realLongPstLimit = tmp_ydpst + tmp_tdpst;
+                map_iterator->second["longYdPosition"] = tmp_ydpst;
+                map_iterator->second["longTotalPosition"] = realLongPstLimit;
+//                if(tmp_ydpst == 0){//sell open
+//                    shortPstIsClose = 1;
+//                    short_offset_flag = 1;
+//                }
+            }
+        }
+    }
+    tradeParaProcessTwo();
+    string tmpmsg;
     for(unordered_map<string,unordered_map<string,int>>::iterator it=positionmap.begin();it != positionmap.end();it ++){
-		tmpmsg.append(it->first).append("持仓情况:");
-		char char_tmp_pst[10] = {'\0'};
-		sprintf(char_tmp_pst,"%d",it->second["longTotalPosition"]);
-		tmpmsg.append("多头数量=");
-		tmpmsg.append(char_tmp_pst);
-		char char_tmp_pst2[10] = {'\0'};
-		sprintf(char_tmp_pst2,"%d",it->second["shortTotalPosition"]);
-		tmpmsg.append("空头数量=");
-		tmpmsg.append(char_tmp_pst2);
-	}
+        tmpmsg.append(it->first).append("持仓情况:");
+        char char_tmp_pst[10] = {'\0'};
+        char char_longyd_pst[10] = {'\0'};
+        char char_longtd_pst[10] = {'\0'};
+        sprintf(char_tmp_pst,"%d",it->second["longTotalPosition"]);
+        sprintf(char_longyd_pst,"%d",it->second["longYdPosition"]);
+        sprintf(char_longtd_pst,"%d",it->second["longTdPosition"]);
+        tmpmsg.append("多头数量=");
+        tmpmsg.append(char_tmp_pst);
+        tmpmsg.append(";今仓数量=");
+        tmpmsg.append(char_longtd_pst);
+        tmpmsg.append(";昨仓数量=");
+        tmpmsg.append(char_longyd_pst);
+        char char_tmp_pst2[10] = {'\0'};
+        char char_shortyd_pst[10] = {'\0'};
+        char char_shorttd_pst[10] = {'\0'};
+        sprintf(char_tmp_pst2,"%d",it->second["shortTotalPosition"]);
+        sprintf(char_shortyd_pst,"%d",it->second["shortYdPosition"]);
+        sprintf(char_shorttd_pst,"%d",it->second["shortTdPosition"]);
+        tmpmsg.append("空头数量=");
+        tmpmsg.append(char_tmp_pst2);
+        tmpmsg.append(";今仓数量=");
+        tmpmsg.append(char_shorttd_pst);
+        tmpmsg.append(";昨仓数量=");
+        tmpmsg.append(char_shortyd_pst);
+    }
+    cout<<tmpmsg<<endl;
     LOG(INFO)<<tmpmsg;
 	return 0;
 }
+void tradeParaProcessTwo(){
+    for(unordered_map<string,unordered_map<string,int>>::iterator map_iterator=positionmap.begin();map_iterator != positionmap.end();map_iterator ++){
+        string tmpmsg;
+        realShortPstLimit = map_iterator->second["shortTotalPosition"];
+        realLongPstLimit = map_iterator->second["longTotalPosition"];
+        int shortYdPst = map_iterator->second["shortYdPosition"];
+        int longYdPst = map_iterator->second["longYdPosition"];
+        if(longYdPst > 0){
+            shortPstIsClose = 2;
+            short_offset_flag = 4;
+        }
+        if(shortYdPst > 0){
+            longPstIsClose = 2;
+            long_offset_flag = 4;
+        }
+        // buy or open judge
+        if(realLongPstLimit > longpstlimit){ //多头超过持仓限额，且必须空头有持仓才能多头平仓
+            char char_limit[10] = {'\0'};
+            sprintf(char_limit,"%d",realLongPstLimit);
+            longPstIsClose = 11;//long can not to open new position
+            tmpmsg.append("多头持仓量=");
+            tmpmsg.append(char_limit).append("大于longpstlimit,long can not to open new position");
+        }else if(realShortPstLimit > shortpstlimit){//空头开平仓判断
+            char char_limit[10] = {'\0'};
+            sprintf(char_limit,"%d",realShortPstLimit);
+            shortPstIsClose = 11;
+            tmpmsg.append("空头持仓量=");
+            tmpmsg.append(char_limit).append("大于shortpstlimit,short can not to open new position");
+        }
+        cout<<tmpmsg<<endl;
+        LOG(INFO)<<tmpmsg;
+        //spread set
+        int bidAkdSpread = abs(realShortPstLimit - realLongPstLimit);
+        if(bidAkdSpread >= firstGap && bidAkdSpread < secondGap && realShortPstLimit  > realLongPstLimit){
+            bidCulTimes += 2;
+            if(down_culculate >= bidCulTimes){
+                down_culculate = (4*down_culculate)/5;
+            }
+        }else if(bidAkdSpread >= secondGap && realShortPstLimit > realLongPstLimit){
+            bidCulTimes += 4;
+            if(down_culculate >= bidCulTimes){
+                down_culculate = (4*down_culculate)/5;
+            }
+        }else if(bidAkdSpread >= firstGap && bidAkdSpread < secondGap && realShortPstLimit < realLongPstLimit){
+            askCulTimes += 2;
+            if(up_culculate >= askCulTimes){
+                up_culculate = (4*up_culculate)/5;
+            }
+        }else if(bidAkdSpread >= secondGap && realShortPstLimit < realLongPstLimit){
+            askCulTimes += 4;
+            if(up_culculate >= askCulTimes){
+                up_culculate = (4*up_culculate)/5;
+            }
+        }else{
+            bidCulTimes = cul_times;
+            askCulTimes = cul_times;
+        }
+        lastABSSpread = bidAkdSpread;
+    }
+}
 //将成交信息组装成对冲报单
-CThostFtdcInputOrderField assamble(CThostFtdcTradeField *pTrade)
+CThostFtdcInputOrderField* assamble(CThostFtdcOrderField *pTrade)
 {
-	CThostFtdcInputOrderField order;
-	memset(&order,0,sizeof(order));
+    CThostFtdcInputOrderField* order = new CThostFtdcInputOrderField();
+    memset(order,0,sizeof(order));
 	//经济公司代码
-	strcpy(order.BrokerID,pTrade->BrokerID);
+    strcpy(order->BrokerID,pTrade->BrokerID);
 	///投资者代码
-	strcpy(order.InvestorID,pTrade->InvestorID);
+    strcpy(order->InvestorID,pTrade->InvestorID);
 	///合约代码
-	strcpy(order.InstrumentID,pTrade->InstrumentID);
-	///报单引用
-	strcpy(order.OrderRef ,pTrade->OrderRef);
+    strcpy(order->InstrumentID,pTrade->InstrumentID);
+//	///报单引用
+//	strcpy(order.OrderRef ,pTrade->OrderRef);
 	///报单价格条件: 限价
-	order.OrderPriceType = THOST_FTDC_OPT_LimitPrice;
-	///买卖方向: 这个要和对手方的一致，即如果我的成交为买，那么这里变成卖
-	TThostFtdcDirectionType	Direction = pTrade->Direction;
-	if (Direction == '0'){
-		order.Direction = THOST_FTDC_D_Sell;
-	} else {
-		order.Direction = THOST_FTDC_D_Buy;
-	}
+    order->OrderPriceType = pTrade->OrderPriceType;
+    ///买卖方向
+//	TThostFtdcDirectionType	Direction = pTrade->Direction;
+    order->Direction = pTrade->Direction;
 	///组合开平标志: 和对手方一致
-	order.CombOffsetFlag[0] = pTrade->OffsetFlag;
+    strcpy(order->CombOffsetFlag,pTrade->CombOffsetFlag);
 	///组合投机套保标志
-	order.CombHedgeFlag[0] = pTrade->HedgeFlag;
+    strcpy(order->CombHedgeFlag,pTrade->CombHedgeFlag);
 	///价格
-	TThostFtdcPriceType price = pTrade->Price;
-	if (order.Direction == THOST_FTDC_D_Sell){
-		//在原对手方报价基础上加上自定义tick
-		order.LimitPrice = price + tickSpreadSell * tick;
-	} else {
-		//在原对手方报价基础上减去自定义tick
-		order.LimitPrice = price - tickSpreadSell * tick;
-	}
-	///数量: 1
-	order.VolumeTotalOriginal = pTrade->Volume;
+    order->LimitPrice = pTrade->LimitPrice;
+    ///数量:
+    //order->VolumeTotalOriginal = pTrade->VolumeTotalOriginal;
 	///有效期类型: 当日有效
-	order.TimeCondition = THOST_FTDC_TC_GFD;
+    order->TimeCondition = pTrade->TimeCondition;
 	///成交量类型: 任何数量
-	order.VolumeCondition = THOST_FTDC_VC_AV;
+    order->VolumeCondition = pTrade->VolumeCondition;
 	///最小成交量: 1
-	order.MinVolume = 1;
+    order->MinVolume = pTrade->MinVolume;
 	///触发条件: 立即
-	order.ContingentCondition = THOST_FTDC_CC_Immediately;
+    order->ContingentCondition = pTrade->ContingentCondition;
 	///强平原因: 非强平
-	order.ForceCloseReason = THOST_FTDC_FCC_NotForceClose;
+    order->ForceCloseReason = pTrade->ForceCloseReason;
 	///自动挂起标志: 否
-	order.IsAutoSuspend = 0;
+    order->IsAutoSuspend = pTrade->IsAutoSuspend;
 	///用户强评标志: 否
-	order.UserForceClose = 0;
-	return order;
+    order->UserForceClose = pTrade->UserForceClose;
+    return order;
+
 }
 
