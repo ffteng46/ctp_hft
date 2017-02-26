@@ -67,7 +67,7 @@ void saveRtnOrder(CThostFtdcOrderField *pOrder);
 //获取交易所响应信息
 string getRtnOrder(CThostFtdcOrderField *pOrder);
 //日志保存路径
-string logpath = "b:\\test\\";
+string logpath = "";
 // 会话参数;
 TThostFtdcFrontIDType	FRONT_ID;	//前置编号;
 //int	FRONT_ID;	//前置编号;
