@@ -741,7 +741,18 @@ void CTraderSpi::OnRtnOrder(CThostFtdcOrderField *pOrder)
             it->second["volume"] = it->second["volume"] + tmp_vol;
         }
     }
-
+    for(unordered_map<double,unordered_map<string,int32_t>>::iterator it = delayedAskOrderMap.begin();it != delayedAskOrderMap.end();it++){
+        string msg ="askordermap-> " + boost::lexical_cast<string>(it->first) + ":orderID=" + boost::lexical_cast<string>(it->second["orderID"]) +
+                ",volume=" + boost::lexical_cast<string>(it->second["orderID"]);
+        cout<<msg<<endl;
+        LOG(INFO)<<msg;
+    }
+    for(unordered_map<double,unordered_map<string,int32_t>>::iterator it = delayedBidOrderMap.begin();it != delayedAskOrderMap.end();it++){
+        string msg ="bidordermap-> " + boost::lexical_cast<string>(it->first) + ":orderID=" + boost::lexical_cast<string>(it->second["orderID"]) +
+                ",volume=" + boost::lexical_cast<string>(it->second["orderID"]);
+        cout<<msg<<endl;
+        LOG(INFO)<<msg;
+    }
 }
 
 ///成交通知
